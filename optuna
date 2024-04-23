@@ -1,0 +1,82 @@
+torch.manual_seed(self.seed)
+torch.cuda.manual_seed(self.seed)
+torch.cuda.manual_seed_all(self.seed)
+torch.backends.cudnn.benchmark = True
+#torch.backends.cudnn.deterministic = True
+# Set a fixed value for the hash seed
+os.environ["PYTHONHASHSEED"] = str(seed)
+np.random.seed(seed)
+random.seed(seed)
+
+def tune_model_process(dataset, device, args, seed=123):
+    device = torch.device(device)
+    args["feature_dim"] = n_dims[dataset]
+    ds = get_dataset(dataset, normalize=args["normalize"], normalize_type=args["normalize_type"], seed=seed)
+    x_train, y_train, x_test, y_test = ds.data()
+
+    algo = SRAD(**args, seed=seed, gpu=device, verbose=True, target_dims=ds.get_target_dims(), log_tensorboard=True,
+                out_dir=None)
+    algo.fit(x_train, train_starts=ds.get_start_position(is_train=True))
+    test_prediction = algo.predict(x_test, starts=ds.get_start_position(is_train=False))
+
+    evaluator = Evaluator(ds_object=ds, batch_size=args["batch_size"], reg_level=reg_levels[dataset],
+                          scale_scores=False)
+    results = evaluator.evaluate_only(test_prediction, labels=y_test.values)
+
+    del algo.model, algo
+    gc.collect()
+
+    with torch.cuda.device(device):
+        torch.cuda.empty_cache()
+    return dataset, results
+
+
+def get_args(trial, dataset):
+    args = get_best_config("SRAD", dataset)
+
+    args["num_epochs"] = 10
+    args["batch_size"] = 256
+    args["seq_len"] = trial.suggest_int("seq_len", 20, 80, step=20)
+    args["reconst_len"] = 5#trial.suggest_categorical("reconst_len", [1, 5, 10])
+    args["d_model"] = 64 #trial.suggest_categorical("d_model", [64, 128])
+    args["n_heads"] = trial.suggest_int("n_heads", 3, 6, step=1)
+    args["use_sparsify_graph_loss"] = trial.suggest_categorical("use_sparsify_graph_loss", [True, False])
+    if args["use_sparsify_graph_loss"]:
+        sparsify_graph_loss_weight_exp = trial.suggest_int("sparsify_graph_loss_weight_exp", -4, 0, step=1)
+        args["sparsify_graph_loss_weight"] = 10 ** sparsify_graph_loss_weight_exp
+        args["sparsify_type"] = "identity"#trial.suggest_categorical("sparsify_type", ["entropy", "identity"])
+    graph_dev_loss_weight_exp = trial.suggest_int("graph_dev_loss_weight_exp", -4, 0, step=1)
+    args["graph_dev_loss_weight"] = 10 ** graph_dev_loss_weight_exp
+    args["sample_graph"] = False
+    args["gcn_type"] = "mixhop"
+    args["normalize_graph"] = True
+    print(args)
+    return args
+
+def parameter_tuning(datasets, device, seeds, num_workers=1):
+
+    def objective(trial):
+        args = get_args(trial, "swat")
+        args["num_workers"] = num_workers
+        results = {}
+
+        # Check duplication and skip if it's detected.
+        for t in trial.study.trials:
+            if t.state != optuna.trial.TrialState.COMPLETE:
+                continue
+
+            if t.params == trial.params:
+                return t.value
+
+        for dataset in datasets:
+            result_ = []
+            for seed in seeds:
+                dataset, result = tune_model_process(dataset, device, seed=seed, args=args)
+                result_.append(result)
+            result_ = {metric: np.mean([r[metric] for r in result_]) for metric in result.keys()}
+            results[dataset] = result_
+            print(f'{dataset} metric = {result_}')
+        return [metric["f1"] for dataset, metric in results.items()]
+
+    study = optuna.create_study(directions=["maximize"]*len(datasets))
+    study.optimize(func=objective, n_trials=200)
