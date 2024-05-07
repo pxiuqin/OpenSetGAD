@@ -346,7 +346,7 @@ def calc_loss(embedding, device, config, node_label):
 
     return bp_loss, accuracy
 
-def prompt_loss(node_features, node_label, class_feature=None, temperature=1.0):
+def prompt_loss_old(node_features, node_label, class_feature=None, temperature=1.0):
     """
     计算prompt损失函数。
     
@@ -378,6 +378,106 @@ def prompt_loss(node_features, node_label, class_feature=None, temperature=1.0):
     
     # 计算损失
     loss = -correct_log_softmax.mean()
+    
+    return loss, _pred
+
+
+def random_hard_negative(loss_values):
+    hard_negatives = np.where(loss_values > 0)[0]
+    return np.random.choice(hard_negatives) if len(hard_negatives) > 0 else None
+
+
+def hardest_negative(loss_values):
+    hard_negative = np.argmax(loss_values)
+    return hard_negative if loss_values[hard_negative] > 0 else None
+
+# 用于计算输入向量矩阵中每对向量之间的平方欧氏距离
+def pdist(vectors):
+    distance_matrix = -2 * vectors.mm(torch.t(vectors)) + vectors.pow(2).sum(dim=1).view(1, -1) + vectors.pow(2).sum(
+        dim=1).view(-1, 1)
+    return distance_matrix
+
+
+def get_triplets(embeddings, labels, adjacency_matrix):
+    embeddings = embeddings.cpu()
+    distance_matrix = pdist(embeddings)  # 计算每对向量的欧几里得距离
+    distance_matrix = distance_matrix.cpu()
+
+    labels = labels.cpu().data.numpy()
+    triplets = []
+    for label in set(labels):
+        label_mask = (labels == label)
+        label_indices = np.where(label_mask)[0]
+        if len(label_indices) < 2:
+            continue
+
+        negative_indices = np.where(np.logical_not(label_mask))[0]
+
+        # 直接使用布尔索引找出在 adjacency_matrix 的 label_indices 行中 negative_indices 列上没有连接的索引
+        negative_indices = [idx for idx in negative_indices if not any(adjacency_matrix[label_indices][:, idx])]
+        negative_indices = np.array(negative_indices)
+
+        anchor_positives = list(combinations(label_indices, 2))
+        anchor_positives = np.array(anchor_positives)
+
+        ap_distances = distance_matrix[anchor_positives[:, 0], anchor_positives[:, 1]]
+
+        for anchor_positive, ap_distance in zip(anchor_positives, ap_distances):
+            loss_values = ap_distance - distance_matrix[torch.LongTensor(np.array([anchor_positive[0]])), torch.LongTensor(negative_indices)]
+
+            loss_values = loss_values.data.cpu().numpy()
+            hard_negative = random_hard_negative(loss_values)
+            if hard_negative is not None:
+                hard_negative = negative_indices[hard_negative]
+                triplets.append([anchor_positive[0], anchor_positive[1], hard_negative])
+
+    if len(triplets) == 0:
+        # 这里可能需要更合理的处理方式，例如随机选择一个负样本
+        triplets.append([anchor_positive[0], anchor_positive[1], negative_indices[0]])
+
+    triplets = np.array(triplets)
+    return torch.LongTensor(triplets)
+
+    
+def prompt_loss(node_features, node_label, adjacency_matrix=None, temperature=1.0):
+    """
+    计算prompt损失函数。
+    
+    :param node_features: 节点特征表示的张量，形状为 (batch_size, num_features)
+    :param node_label: 实例的真实类别标签的张量，形状为 (batch_size,)
+    :param adjacency_matrix: 图的邻接矩阵
+    :param temperature: 温度参数，用于控制softmax的平滑程度
+    :return: 计算得到的prompt损失值
+    """    
+
+    c_embedding = center_embedding(node_features, node_label)
+    distance = distance2center2(node_features, c_embedding)
+
+    distance = 1/F.normalize(distance, dim=1)
+    # distance /= temperature   # 应用温度参数  
+
+    pred = F.log_softmax(distance, dim=1)
+    _pred = torch.argmax(pred, dim=1, keepdim=True).squeeze()
+    
+    # 计算log softmax
+    log_softmax = F.log_softmax(pred, dim=1)
+    
+    # 选择正确类别的log softmax值
+    correct_log_softmax = log_softmax.gather(1, node_label.unsqueeze(1)).squeeze(1)
+    
+    # 计算损失
+    pred_loss = -correct_log_softmax.mean()
+
+    # 结合Triplets损失
+    triplets = get_triplets(node_features, node_label, adjacency_matrix)
+    anchor, positive, negative = node_features[triplets[:, 0]], node_features[triplets[:, 1]], node_features[triplets[:, 2]] 
+    exp_pos = torch.exp(F.cosine_similarity(anchor,positive)/temperature)
+    exp_neg = torch.exp(F.cosine_similarity(anchor,negative)/temperature)
+    cosine_similarity_loss = -1 * torch.log(exp_pos / (exp_pos + exp_neg))
+    triplet_loss = cosine_similarity_loss.mean()
+
+    # 对两种loss求平均
+    loss = pred_loss + triplet_loss
     
     return loss, _pred
 
