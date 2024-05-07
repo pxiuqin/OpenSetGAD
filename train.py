@@ -393,7 +393,7 @@ def initial_train(i, args, data_split, metrics,embedding_save_path, loss_fn, mod
         return model
 
 def initial_train_with_prompt_loss(i, args, data_split, metrics,embedding_save_path,class_emb,model=None):
-    save_path_i, in_feats, num_isolated_nodes, g, labels, train_indices, validation_indices, test_indices = getdata(
+    save_path_i, in_feats, num_isolated_nodes, g, labels, train_indices, validation_indices, test_indices, adjacency_matrix = getdata(
         embedding_save_path, data_split, i, args)
 
     if model is None:  # Construct the initial model
@@ -447,7 +447,7 @@ def initial_train_with_prompt_loss(i, args, data_split, metrics,embedding_save_p
             model.train()
             # forward
             pred = model(blocks)  # Representations of the sampled nodes (in the last layer of the NodeFlow).
-            loss_outputs,_ = prompt_loss(pred, batch_labels, class_emb)
+            loss_outputs,_ = prompt_loss(pred, batch_labels, adjacency_matrix)
             loss = loss_outputs[0] if type(loss_outputs) in (tuple, list) else loss_outputs
             losses.append(loss.item())
             total_loss += loss.item()
@@ -1026,7 +1026,7 @@ def gpf_prompt_train(i, data_split, metrics, embedding_save_path, loss_fn, pretr
 
 
 def graphpro_prompt_train(i, data_split, metrics, embedding_save_path, loss_fn, model, label_center, args, class_emb=None, score_result=[]):
-    save_path_i, in_feats, num_isolated_nodes, g, labels, test_indices = getdata(
+    save_path_i, in_feats, num_isolated_nodes, g, labels, test_indices, adjacency_matrix = getdata(
         embedding_save_path, data_split, i, args)
 
     # 训练之前先搞下评估，然后看看一个block完成后，评估的比较
@@ -1103,7 +1103,7 @@ def graphpro_prompt_train(i, data_split, metrics, embedding_save_path, loss_fn, 
             # print(batch_labels)
             true_labels = process_tensor(batch_labels, label_center.keys())
 
-            loss,_pred = prompt_loss(pred, batch_labels, class_emb)
+            loss,_pred = prompt_loss(pred, batch_labels, adjacency_matrix)
 
             losses.append(loss.item())
             total_loss += loss.item()
