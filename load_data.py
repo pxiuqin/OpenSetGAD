@@ -148,7 +148,7 @@ def getdata(embedding_save_path,data_split,i,args):
     g.apply_edges(compute_time_weight)   # 计算边的权重
 
     if i==0:
-        return save_path_i, in_feats, num_isolated_nodes, g, labels, train_indices, validation_indices, test_indices
+        return save_path_i, in_feats, num_isolated_nodes, g, labels, train_indices, validation_indices, test_indices, data.matrix.toarray()
     else:
-        return save_path_i, in_feats, num_isolated_nodes, g, labels, test_indices
+        return save_path_i, in_feats, num_isolated_nodes, g, labels, test_indices, data.matrix.toarray()
 
