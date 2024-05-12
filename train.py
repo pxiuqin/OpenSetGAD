@@ -199,13 +199,16 @@ def extract_embeddings(g, model, num_all_samples, args, prompt = None, prompt_mo
                 extract_features = model(blocks)
 
         assert batch_id == 0
+        if torch.any(torch.isnan(extract_features)):
+            print('-------------------------------')
+
         extract_features = extract_features.data.cpu().numpy()
         extract_labels = extract_labels.data.cpu().numpy()
 
     return (extract_features, extract_labels)
 
 def initial_train(i, args, data_split, metrics,embedding_save_path, loss_fn, model=None):
-    save_path_i, in_feats, num_isolated_nodes, g, labels, train_indices, validation_indices, test_indices = getdata(
+    save_path_i, in_feats, num_isolated_nodes, g, labels, train_indices, validation_indices, test_indices, adjacency_matrix = getdata(
         embedding_save_path, data_split, i, args)
 
     if model is None:  # Construct the initial model
@@ -392,7 +395,7 @@ def initial_train(i, args, data_split, metrics,embedding_save_path, loss_fn, mod
     else:
         return model
 
-def initial_train_with_prompt_loss(i, args, data_split, metrics,embedding_save_path,class_emb,model=None):
+def initial_train_with_prompt_loss(i, args, data_split, metrics, embedding_save_path, class_emb, model=None):
     save_path_i, in_feats, num_isolated_nodes, g, labels, train_indices, validation_indices, test_indices, adjacency_matrix = getdata(
         embedding_save_path, data_split, i, args)
 
@@ -445,9 +448,10 @@ def initial_train_with_prompt_loss(i, args, data_split, metrics,embedding_save_p
 
             start_batch = time.time()
             model.train()
+            
             # forward
             pred = model(blocks)  # Representations of the sampled nodes (in the last layer of the NodeFlow).
-            loss_outputs,_ = prompt_loss(pred, batch_labels, adjacency_matrix)
+            loss_outputs,_pred = prompt_loss(pred, batch_labels, adjacency_matrix)
             loss = loss_outputs[0] if type(loss_outputs) in (tuple, list) else loss_outputs
             losses.append(loss.item())
             total_loss += loss.item()
@@ -456,7 +460,7 @@ def initial_train_with_prompt_loss(i, args, data_split, metrics,embedding_save_p
             optimizer.step()
 
             for metric in metrics:
-                metric(pred, batch_labels, loss_outputs)
+                metric(_pred, batch_labels, loss_outputs)
 
             batch_seconds_spent = time.time() - start_batch
             seconds_train_batches.append(batch_seconds_spent)
@@ -527,6 +531,8 @@ def initial_train_with_prompt_loss(i, args, data_split, metrics,embedding_save_p
         l_feas = extract_features[l_indices]
         l_cen = np.mean(l_feas, 0)
         label_center[l] = l_cen
+    joblib.dump(label_center,save_path_i + '/models/label_center.dump')
+
     label_center_emb = torch.FloatTensor(np.array(list(label_center.values()))).cuda() if args.use_cuda else torch.FloatTensor(np.array(list(label_center.values())))
     torch.save(label_center_emb,save_path_i + '/models/center.pth')
 
@@ -1024,8 +1030,7 @@ def gpf_prompt_train(i, data_split, metrics, embedding_save_path, loss_fn, pretr
 
     return pretrain_model
 
-
-def graphpro_prompt_train(i, data_split, metrics, embedding_save_path, loss_fn, model, label_center, args, class_emb=None, score_result=[]):
+def graphpro_prompt_train(i, data_split, metrics, embedding_save_path, model, label_center, args, old_label_rate, score_result=[]):
     save_path_i, in_feats, num_isolated_nodes, g, labels, test_indices, adjacency_matrix = getdata(
         embedding_save_path, data_split, i, args)
 
@@ -1076,42 +1081,45 @@ def graphpro_prompt_train(i, data_split, metrics, embedding_save_path, loss_fn, 
             pred = model(blocks)  # Representations of the sampled nodes (in the last layer of the NodeFlow) add prompt vector
 
             # 伪标签的Loss函数
-            pred = F.normalize(pred, 2, 1)
+            # pred_norm = F.normalize(pred, 2, 1)
             rela_center_vec = torch.mm(pred,label_center_emb.t())
             rela_center_vec = F.normalize(rela_center_vec,2,1)
             epsilon = 1e-10
             rela_center_vec = torch.clamp(rela_center_vec, min=epsilon)
             entropy = torch.mul(torch.log(rela_center_vec), rela_center_vec)
             entropy = torch.sum(entropy,dim=1)
-            value,old_indices = torch.topk(entropy.reshape(-1),int(entropy.shape[0]/2),largest=True)   # 最大熵的一半
-            value,novel_indices = torch.topk(entropy.reshape(-1),int(entropy.shape[0]/2),largest=False)   # 最小熵的一半
+            value,old_indices = torch.topk(entropy.reshape(-1),int(old_label_rate*entropy.shape[0]),largest=True)   # 最大熵的一半
+            # value,novel_indices = torch.topk(entropy.reshape(-1),int(entropy.shape[0]/2),largest=False)   # 最小熵的一半
 
-            # 已知类预测的
+            # 模型预测结果，通过欧式距离判断属于已知类的那类
             distance = distance2center2(pred, label_center_emb)
             distance = 1/F.normalize(distance, dim=1)
             label_pred = F.log_softmax(distance, dim=1)
-            label_pred = torch.argmax(label_pred, dim=1, keepdim=True).squeeze()
+            label_pred = torch.argmax(label_pred, dim=1, keepdim=True).squeeze()  # 这里是判断所有预测node，属于label_center_emb的那个类别
 
             # 开始构建一个样本，创建一个新类的标识数组
-            combined_tensor = torch.full((pred.shape[0],), max(label_center.keys()) + 1)
+            pseudo_new_label = len(label_center.keys())
+            combined_tensor = torch.full((pred.shape[0],), pseudo_new_label)
             combined_tensor[old_indices] = label_pred[old_indices]
-            # combined_tensor[novel_indices] = max(label_center.keys()) + 1
-            # print(combined_tensor)
-
-            # 创建一个真实的二分类
-            # print(label_center.keys())
-            # print(batch_labels)
-            true_labels = process_tensor(batch_labels, label_center.keys())
-
-            loss,_pred = prompt_loss(pred, batch_labels, adjacency_matrix)
-
+            loss,_pred = prompt_loss(pred, combined_tensor, adjacency_matrix)
             losses.append(loss.item())
             total_loss += loss.item()
 
             optimizer.zero_grad()
-            loss.requires_grad_(True)
             loss.backward()
             optimizer.step()
+
+            # 验证 pseudo old label 是否准确
+            pseudo_old_labels = batch_labels[old_indices]
+            print('pseudo old event:',len(set(pseudo_old_labels.tolist())))
+            print('true old event:',len(label_center.keys()))
+            print(set(label_center.keys()) & set(pseudo_old_labels.tolist()))
+
+            # 构建一个 pseudo old&new label
+            true_labels = process_tensor(batch_labels, label_center.keys())
+            current_old_label_rate = torch.sum(true_labels == 0).item() / true_labels.shape[0]  # 计算当前旧类占比
+            true_labels[true_labels == 1] = pseudo_new_label
+            true_labels[old_indices] = label_pred[old_indices] 
 
             for metric in metrics:
                 metric(_pred, true_labels, loss)   # combined_tensor
@@ -1133,10 +1141,12 @@ def graphpro_prompt_train(i, data_split, metrics, embedding_save_path, loss_fn, 
         mins_train_epochs.append(mins_spent)
 
         extract_features, extract_labels = extract_embeddings(g, model, len(labels), args)
-
-        # save_embeddings(extract_nids, extract_features, extract_labels, extract_train_tags, save_path_i, epoch)
-        test_value = evaluate(extract_features, extract_labels, test_indices, epoch, num_isolated_nodes,
-                                save_path_i, args, True)
+        try:
+            # save_embeddings(extract_nids, extract_features, extract_labels, extract_train_tags, save_path_i, epoch)
+            test_value = evaluate(extract_features, extract_labels, test_indices, epoch, num_isolated_nodes,
+                                    save_path_i, args, True)
+        except Exception as e:
+            print(e)
         # 比较分数
         if test_value >= MAX_SCORE[str(i)]:
             score_result.append(f' Epoch {epoch+1} : {test_value}')
@@ -1145,9 +1155,9 @@ def graphpro_prompt_train(i, data_split, metrics, embedding_save_path, loss_fn, 
     model_path = save_path_i + '/models'
     if not os.path.isdir(model_path):
         os.mkdir(model_path)
-    p = model_path + '/finetune.pt'
-    torch.save(model.state_dict(), p)
-    print('finetune model saved after epoch ', str(epoch))
+    # p = model_path + '/finetune.pt'
+    # torch.save(model.state_dict(), p)
+    # print('finetune model saved after epoch ', str(epoch))
 
     # update & save label_center
     extract_features, extract_labels = extract_embeddings(g, model, len(labels), args)
@@ -1162,16 +1172,19 @@ def graphpro_prompt_train(i, data_split, metrics, embedding_save_path, loss_fn, 
 
         l_cen = np.mean(l_feas,0)
         label_center[l] = l_cen
-    joblib.dump(label_center,save_path_i + '/models/label_center.dump')
+    # joblib.dump(label_center,save_path_i + '/models/label_center.dump')
 
-    # Save time spent on epochs
-    np.save(save_path_i + '/mins_train_epochs.npy', np.asarray(mins_train_epochs))
-    print('Saved mins_train_epochs.')
-    # Save time spent on batches
-    np.save(save_path_i + '/seconds_train_batches.npy', np.asarray(seconds_train_batches))
-    print('Saved seconds_train_batches.')
+    # 对旧类占比求平均
+    old_label_rate = (old_label_rate + current_old_label_rate) / 2 
+    print(old_label_rate)
+    # # Save time spent on epochs
+    # np.save(save_path_i + '/mins_train_epochs.npy', np.asarray(mins_train_epochs))
+    # print('Saved mins_train_epochs.')
+    # # Save time spent on batches
+    # np.save(save_path_i + '/seconds_train_batches.npy', np.asarray(seconds_train_batches))
+    # print('Saved seconds_train_batches.')
 
-    return model,label_center
+    return model,label_center,old_label_rate
 
 def prompt_domain_train(i, data_split, metrics, embedding_save_path, loss_fn, model, clip_model, label_center_emb, args):
     save_path_i, in_feats, num_isolated_nodes, g, labels, test_indices = getdata(
@@ -1399,127 +1412,124 @@ def prompt_domain_train(i, data_split, metrics, embedding_save_path, loss_fn, mo
 
     return model
 
+def graphpro_fine_tune_train(i, data_split, embedding_save_path, model, label_center, args):
+    save_path_i, in_feats, num_isolated_nodes, g, labels, test_indices, adjacency_matrix = getdata(
+        embedding_save_path, data_split, i, args)
 
-def losses(predictions, proposals, is_source = False):
-    """
-    Args:
-        predictions: return values of :meth:`forward()`.
-        proposals (list[Instances]): proposals that match the features that were used
-            to compute predictions. The fields ``proposal_boxes``, ``gt_boxes``,
-            ``gt_classes`` are expected.
+    # 训练之前先搞下评估，然后看看一个block完成后，评估的比较
+    extract_features, extract_labels = extract_embeddings(g, model, len(labels), args)
+    test_value = evaluate(extract_features, extract_labels, test_indices, -1, num_isolated_nodes,
+                            save_path_i, args, True)
 
-    Returns:
-        Dict[str, Tensor]: dict of losses
-    """
-    # scores: [*, domains * (cls + 1)]
-    scores, proposal_deltas, da_scores, ema_scores = predictions
-    if self.is_prompt_tuning:
-        # if prompt tuning, use origin scores as pseudo labels, and use da_scores as logits
-        pseudo_scores = scores
-        scores = da_scores
-    #####################################
-    N, D_C = scores.shape
-    C = int(D_C / 2)
-    score_across_domains = scores
-    score_source = scores[:, :C]
-    score_target = scores[:, C:]
-    if is_source:
-        scores = score_source
-    else:
-        scores = score_target
+    # Optimizer
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4, amsgrad=False)
+
+    # Start prompt tuning
+    message = "\n------------ Start prompt tuning------------\n"
+    print(message)
+    with open(save_path_i + '/log.txt', 'a') as f:
+        f.write(message)
+
+    label_center_emb = torch.FloatTensor(np.array(list(label_center.values()))).cuda() if args.use_cuda else torch.FloatTensor(np.array(list(label_center.values())))
     
-    # parse classification outputs
-    gt_classes = (
-        cat([p.gt_classes for p in proposals], dim=0) if len(proposals) else torch.empty(0)
-    )
-    _log_classification_stats(scores, gt_classes)
+    # record the time spent in seconds on each batch of all training/maintaining epochs
+    seconds_train_batches = []
+    # record the time spent in mins on each epoch
+    mins_train_epochs = []
+    for epoch in range(args.prompt_epochs):
+        start_epoch = time.time()
+        losses = []
+        total_loss = 0
 
-    # parse box regression outputs
-    if len(proposals):
-        proposal_boxes = cat([p.proposal_boxes.tensor for p in proposals], dim=0)  # Nx4
-        assert not proposal_boxes.requires_grad, "Proposals should not require gradients!"
-        # If "gt_boxes" does not exist, the proposals must be all negative and
-        # should not be included in regression loss computation.
-        # Here we just use proposal_boxes as an arbitrary placeholder because its
-        # value won't be used in self.box_reg_loss().
-        gt_boxes = cat(
-            [(p.gt_boxes if p.has("gt_boxes") else p.proposal_boxes).tensor for p in proposals],
-            dim=0,
-        )
-    else:
-        proposal_boxes = gt_boxes = torch.empty((0, 4), device=proposal_deltas.device)
-    
-    # loss weights
-    if self.cls_loss_weight is not None and self.cls_loss_weight.device != scores.device:
-        self.cls_loss_weight = self.cls_loss_weight.to(scores.device)
-    if self.focal_scaled_loss is not None:
-        loss_cls = self.focal_loss(scores, gt_classes, gamma=self.focal_scaled_loss)
-    else:    
-        loss_cls = cross_entropy(scores, gt_classes, reduction="mean") if self.cls_loss_weight is None else \
-                    cross_entropy(scores, gt_classes, reduction="mean", weight=self.cls_loss_weight)
-    losses = {
-        "loss_cls": loss_cls,
-        "loss_box_reg": self.box_reg_loss(
-            proposal_boxes, gt_boxes, proposal_deltas, gt_classes
-        ),
-    }
-    #############################################
-    if self.is_prompt_tuning:
-        # train learnable prompt embeddings
-        if is_source:
-            losses["loss_across_domains"] = self.focal_loss(score_across_domains, gt_classes, gamma=self.focal_scaled_loss)
-            losses["loss_target_domain"] = self.focal_loss(score_target, gt_classes, gamma=self.focal_scaled_loss)
-            # source domain do not need teacher
-        # pseudo loss
-        if not is_source:
-            pseudo_scores = pseudo_scores[:, C:] 
-            pseudo_label = torch.softmax(pseudo_scores, dim=-1).detach()
-            max_probs, label_p = torch.max(pseudo_label, dim=-1)
-            mask = max_probs.ge(0.5).float()
-            C_label_p = label_p + C
-            losses['loss_pseudo_target_domain'] = (F.cross_entropy(
-                    score_target, label_p, reduction="none") * mask).sum() / mask.sum()
-            losses['loss_target_entropy'] = - (pseudo_label * torch.log_softmax(score_target, dim=-1)).sum() / N
-            losses['loss_pseudo_across_domain'] = 0.25 * (F.cross_entropy(
-                    score_across_domains, C_label_p, reduction="none") * mask).sum() / mask.sum()
-            # Don't apply pseudo loss to source prompt
-            # losses['loss_pseudo_source_domain'] = 0.25 * (F.cross_entropy(
-            #        score_source, label_p, reduction="none") * mask).sum() / mask.sum()
-    ########################################
+        sampler = dgl.dataloading.MultiLayerFullNeighborSampler(2)
+        dataloader = dgl.dataloading.DataLoader(
+            g, test_indices, sampler,
+            batch_size=args.batch_size,
+            shuffle=True,
+            drop_last=False,
+            )
 
-    return {k: v * self.loss_weight.get(k, 1.0) for k, v in losses.items()}
+        for batch_id, (input_nodes, output_nodes, blocks) in enumerate(dataloader):
+            device = torch.device("cuda:{}".format(args.gpuid) if args.use_cuda else "cpu")
+            blocks = [b.to(device) for b in blocks]
 
-def focal_loss(inputs, targets, gamma=0.5, reduction="mean"):
-    """Inspired by RetinaNet implementation"""
-    if targets.numel() == 0 and reduction == "mean":
-        return input.sum() * 0.0  # connect the gradient
-    
-    # focal scaling
-    ce_loss = F.cross_entropy(inputs, targets, reduction="none")
-    if torch.any(torch.isinf(ce_loss)):
-        print("ce loss is inf")
-    if torch.any(torch.isnan(ce_loss)):
-        print("ce loss is nan")
-    p = F.softmax(inputs, dim=-1)
-    p = torch.clamp(p, min=1e-7, max=1.0 - 1e-7)
-    p_t = p[torch.arange(p.size(0)).to(p.device), targets]  # get prob of target class
-    loss = ce_loss * ((1 - p_t) ** gamma)
-    if torch.any(torch.isinf(loss)):
-        print("loss is inf")
-    if torch.any(torch.isnan(loss)):
-        print("loss is nan")
-    if torch.equal(torch.mean(loss), torch.zeros_like(torch.mean(loss))):
-        print('loss is 0!')
+            start_batch = time.time()
+            model.train()
 
+            # forward
+            pred = model(blocks)  # Representations of the sampled nodes (in the last layer of the NodeFlow) add prompt vector
 
-    # bg loss weight
-    if self.cls_loss_weight is not None:
-        loss_weight = torch.ones(loss.size(0)).to(p.device)
-        loss_weight[targets == self.num_classes] = self.cls_loss_weight[-1].item()
-        loss = loss * loss_weight
+            # 伪标签的Loss函数
+            pred_norm = F.normalize(pred, 2, 1)
+            rela_center_vec = torch.mm(pred_norm,label_center_emb.t())
+            rela_center_vec = F.normalize(rela_center_vec,2,1)
+            epsilon = 1e-10
+            rela_center_vec = torch.clamp(rela_center_vec, min=epsilon)
+            entropy = torch.mul(torch.log(rela_center_vec), rela_center_vec)
+            entropy = torch.sum(entropy,dim=1)
+            value, old_indices = torch.topk(entropy.reshape(-1),int(args.topk),largest=True)   # 最大熵的一半
+            # value, novel_indices = torch.topk(entropy.reshape(-1),int(entropy.shape[0]/2),largest=False)   # 最小熵的一半
 
-    if reduction == "mean":
-        loss = loss.mean()
+            # 已知类预测的
+            distance = distance2center2(pred, label_center_emb)
+            distance = 1/F.normalize(distance, dim=1)
+            label_pred = F.log_softmax(distance, dim=1)
+            label_pred = torch.argmax(label_pred, dim=1, keepdim=True).squeeze()
 
-    return loss
+            # 开始构建一个样本，创建一个新类的标识数组
+            combined_tensor = torch.full((pred.shape[0],), max(label_center.keys()) + 1)
+            combined_tensor[old_indices] = label_pred[old_indices]
 
+            loss, _pred = prompt_loss(pred, combined_tensor, adjacency_matrix)
+
+            losses.append(loss.item())
+            total_loss += loss.item()
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            batch_seconds_spent = time.time() - start_batch
+            seconds_train_batches.append(batch_seconds_spent)
+            # end one batch
+
+        total_loss /= (batch_id + 1)
+        message = 'Epoch: {}/{}. Average loss: {:.4f}'.format(epoch + 1, args.prompt_epochs, total_loss)
+        mins_spent = (time.time() - start_epoch) / 60
+        message += '\nThis epoch took {:.2f} mins'.format(mins_spent)
+        message += '\n'
+        print(message)
+        # with open(save_path_i + '/log.txt', 'a') as f:
+        #     f.write(message)
+        mins_train_epochs.append(mins_spent)
+
+        extract_features, extract_labels = extract_embeddings(g, model, len(labels), args)
+
+        # save_embeddings(extract_nids, extract_features, extract_labels, extract_train_tags, save_path_i, epoch)
+        test_value = evaluate(extract_features, extract_labels, test_indices, epoch, num_isolated_nodes,
+                                save_path_i, args, True)
+
+    # Save model
+    model_path = save_path_i + '/models'
+    if not os.path.isdir(model_path):
+        os.mkdir(model_path)
+    p = model_path + '/finetune.pt'
+    torch.save(model.state_dict(), p)
+    print('finetune model saved after epoch ', str(epoch))
+
+    # update & save label_center
+    extract_features, extract_labels = extract_embeddings(g, model, len(labels), args)
+    for l in set(extract_labels):
+        l_indices = np.where(extract_labels==l)[0]
+        l_feas = extract_features[l_indices]
+
+        # 通过判断历史的计算值，可以构建一个移动平均，使得平均值更加稳定
+        if l in label_center:
+            label_center_expanded = np.expand_dims(label_center[l], axis=0)
+            l_feas = np.concatenate((l_feas, label_center_expanded))
+
+        l_cen = np.mean(l_feas,0)
+        label_center[l] = l_cen
+    joblib.dump(label_center,save_path_i + '/models/label_center.dump')
+
+    return model,label_center,test_value
