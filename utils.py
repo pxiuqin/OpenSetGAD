@@ -18,17 +18,59 @@ class OnlineTripletLoss(nn.Module):
         self.margin = margin
         self.triplet_selector = triplet_selector
 
-    def forward(self, embeddings, target):
+    def triplet_margin_loss(self, anchor, positive, negative,):
+        ap_distances = (anchor - positive).pow(2).sum(1)  # .pow(.5)
+        an_distances = (anchor - negative).pow(2).sum(1)  # .pow(.5)
+        losses = F.relu(ap_distances - an_distances + self.margin)
+
+        return losses.mean()
+    
+    def cosine_similarity_loss(self, anchor, positive, negative, temperature=1):
+        temperature=torch.tensor(temperature,dtype=float)
+        losses = -1 * torch.log(torch.exp(F.cosine_similarity(anchor,positive)/temperature) / torch.exp(F.cosine_similarity(anchor,negative)/temperature))
+
+        return losses.mean()
+
+    def forward(self, embeddings, target, loss_fn = 'triplet_margin'):
         triplets = self.triplet_selector.get_triplets(embeddings, target)   # 进行了一波triplet的采样，关键是negative的处理
 
         if embeddings.is_cuda:
             triplets = triplets.cuda()
 
-        ap_distances = (embeddings[triplets[:, 0]] - embeddings[triplets[:, 1]]).pow(2).sum(1)  # .pow(.5)
-        an_distances = (embeddings[triplets[:, 0]] - embeddings[triplets[:, 2]]).pow(2).sum(1)  # .pow(.5)
-        losses = F.relu(ap_distances - an_distances + self.margin)
+        anchor, positive, negative = embeddings[triplets[:, 0]], embeddings[triplets[:, 1]], embeddings[triplets[:, 2]] 
 
-        return losses.mean(), len(triplets)
+        if loss_fn == 'cosine_similarity':
+            loss = self.cosine_similarity_loss(anchor, positive, negative)
+        else:
+            loss = self.triplet_margin_loss(anchor, positive, negative)
+        
+        
+        return loss, len(triplets)
+    
+
+class OnlineLinkPredictionLoss(nn.Module):
+
+    def __init__(self, temperature, triplet_selector):
+        super(OnlineLinkPredictionLoss, self).__init__()
+        self.temperature = temperature
+        self.triplet_selector = triplet_selector
+    
+    def cosine_similarity_loss(self, anchor, positive, negative):
+        temperature=torch.tensor(self.temperature, dtype=float)
+        losses = -1 * torch.log(torch.exp(F.cosine_similarity(anchor,positive)/temperature) / torch.exp(F.cosine_similarity(anchor,negative)/temperature))
+
+        return losses.mean()
+
+    def forward(self, embeddings, target, adjacency_matrix):
+        triplets = self.triplet_selector.get_triplets(embeddings, target, adjacency_matrix)
+
+        if embeddings.is_cuda:
+            triplets = triplets.cuda()
+
+        anchor, positive, negative = embeddings[triplets[:, 0]], embeddings[triplets[:, 1]], embeddings[triplets[:, 2]] 
+        loss = self.cosine_similarity_loss(anchor, positive, negative)
+        
+        return loss, len(triplets)
     
 
 # 用于计算输入向量矩阵中每对向量之间的平方欧氏距离
@@ -49,6 +91,66 @@ class TripletSelector:
 
     def get_triplets(self, embeddings, labels):
         raise NotImplementedError
+
+
+class FunctionLinkPredictionSelector(TripletSelector):
+    def __init__(self, margin, negative_selection_fn, cpu=True):
+        super(FunctionLinkPredictionSelector, self).__init__()
+        self.cpu = cpu
+        self.margin = margin
+        self.negative_selection_fn = negative_selection_fn
+
+
+    def get_triplets(self, embeddings, labels, adjacency_matrix):
+        if self.cpu:
+            embeddings = embeddings.cpu()
+        distance_matrix = pdist(embeddings)  # 计算每对向量的欧几里得距离
+        distance_matrix = distance_matrix.cpu()
+
+        labels = labels.cpu().data.numpy()
+
+        # 使用 adjacency_matrix 确定未发生变化的节点索引
+        adjacency_matrix = adjacency_matrix.cpu().data.numpy()
+        unchanged_idx = np.where(np.sum(adjacency_matrix, axis=1) == 0)[0]
+        non_isolated_unchanged_idx = np.where(np.logical_not(np.sum(adjacency_matrix, axis=1) == 0))[0]
+
+        triplets = []
+
+        for label in set(labels):
+            label_mask = (labels == label)
+            label_indices = np.where(label_mask)[0]
+            if len(label_indices) < 2:
+                continue
+
+            # 确保 label_indices 在 unchanged_idx 中
+            label_indices = list(set(label_indices) & set(unchanged_idx))
+
+            negative_indices = np.where(np.logical_not(label_mask))[0]
+            # 确保 negative_indices 在 non_isolated_unchanged_idx 中
+            negative_indices = list(set(negative_indices) & set(non_isolated_unchanged_idx))
+
+            anchor_positives = list(combinations(label_indices, 2))
+            anchor_positives = np.array(anchor_positives)
+
+            ap_distances = distance_matrix[anchor_positives[:, 0], anchor_positives[:, 1]]
+
+            for anchor_positive, ap_distance in zip(anchor_positives, ap_distances):
+                loss_values = ap_distance - \
+                    distance_matrix[torch.LongTensor(np.array([anchor_positive[0]])), torch.LongTensor(negative_indices)] + \
+                    self.margin
+
+                loss_values = loss_values.data.cpu().numpy()
+                hard_negative = self.negative_selection_fn(loss_values)
+                if hard_negative is not None:
+                    hard_negative = negative_indices[hard_negative]
+                    triplets.append([anchor_positive[0], anchor_positive[1], hard_negative])
+
+        if len(triplets) == 0:
+            # 这里可能需要更合理的处理方式，例如随机选择一个负样本
+            triplets.append([anchor_positive[0], anchor_positive[1], negative_indices[0]])
+
+        triplets = np.array(triplets)
+        return torch.LongTensor(triplets)
 
 
 class FunctionNegativeTripletSelector(TripletSelector):
