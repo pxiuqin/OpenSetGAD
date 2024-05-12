@@ -3,6 +3,7 @@ import torch.nn.functional as F
 import torch
 import dgl
 
+torch.set_default_dtype(torch.float32)
 
 class GateLayer(nn.Module):
     def __init__(self, emb_size, emb_dropout=0):
@@ -21,10 +22,10 @@ class GATLayer(nn.Module):
         super(GATLayer, self).__init__()
 
         # 更加phase来判断是否为finetune
-        if phase == 'finetune':
-            self.emb_gate = GateLayer(in_dim)
-        else:
-            self.emb_gate = None
+        # if phase == 'finetune':
+        #     self.emb_gate = GateLayer(in_dim)
+        # else:
+        #     self.emb_gate = None
 
         # equation (1) reference: https://docs.dgl.ai/en/0.4.x/tutorials/models/1_gnn/9_gat.html
         self.fc = nn.Linear(in_dim, out_dim, bias=False)
@@ -80,12 +81,13 @@ class GATLayer(nn.Module):
         time_weight = F.softmax(nodes.mailbox['time_weight'], dim=1)
         # equation (4)
         # 使用时间权重加权邻居节点的特征
-        h = torch.sum((alpha/2 + time_weight/2)* nodes.mailbox['z'], dim=1)
+        # h = torch.sum((alpha/2 + time_weight/2)* nodes.mailbox['z'], dim=1)
+        h = torch.sum((alpha*0.4 + time_weight*0.6)* nodes.mailbox['z'], dim=1)
         return {'h': h}
     
     def forward(self, blocks, layer_id):
         h = blocks[layer_id].srcdata['features']
-        h = self.emb_gate(h) if self.emb_gate else h
+        # h = self.emb_gate(h) if self.emb_gate else h
         z = self.fc(h)
         blocks[layer_id].srcdata['z'] = z
         z_dst = z[:blocks[layer_id].number_of_dst_nodes()]
@@ -137,11 +139,27 @@ class GAT(nn.Module):
         # print(h.shape)
         blocks[1].srcdata['features'] = h  # 把第0层的输出来更新第1层的src features
         h = self.layer2(blocks, 1)
-        #h = F.normalize(h, p=2, dim=1)
+        h = F.normalize(h, p=2, dim=1)
 
         return h  # 这里输出第1层的 features  维度为 out_dim 默认64
     
+class Encoder(torch.nn.Module):
+    def __init__(self, encoder, hidden_dim):
+        super(Encoder, self).__init__()
+        self.encoder = encoder
+        self.project = torch.nn.Linear(hidden_dim, hidden_dim)
+        # uniform(hidden_dim, self.project.weight)
 
+    @staticmethod
+    def corruption(x, edge_index):
+        return x[torch.randperm(x.size(0))], edge_index
+
+    def forward(self, x, edge_index):
+        z = self.encoder(x, edge_index)
+        g = self.project(torch.sigmoid(z.mean(dim=0, keepdim=True)))
+        zn = self.encoder(*self.corruption(x, edge_index))
+        return z, g, zn
+    
 class GIN(torch.nn.Module):
     def __init__(self, in_dim, hidden_dim):
         super(GIN, self).__init__()
