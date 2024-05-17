@@ -415,6 +415,32 @@ def get_triplets(embeddings, labels, adjacency_matrix):
     triplets = np.array(triplets)
     return torch.LongTensor(triplets)
 
+
+def get_triplets_new(embeddings, labels, adjacency_matrix):
+    embeddings = embeddings.cpu()
+    distance_matrix = pdist(embeddings)  # 计算每对向量的欧几里得距离
+    distance_matrix = distance_matrix.cpu()
+
+    labels = labels.cpu().data.numpy()
+    triplets = []
+    for anchor_index, _ in enumerate(labels): 
+        connected_indices = np.where(adjacency_matrix[anchor_index] == True)[0]
+        connected_indices = connected_indices[connected_indices != anchor_index]
+        disconnected_indices = np.where(adjacency_matrix[anchor_index] == False)[0]
+
+        for postive_index in connected_indices:
+            negative_index = np.random.choice(disconnected_indices)
+            triplets.append([anchor_index, postive_index, negative_index])
+
+
+    if len(triplets) == 0:
+        # 这里可能需要更合理的处理方式，例如随机选择一个负样本
+        triplets.append([anchor_index, postive_index, disconnected_indices[0].item()])
+        print('------------------------------------------------------------------')
+
+    triplets = np.array(triplets)
+    return torch.LongTensor(triplets)
+
     
 def prompt_loss(node_features, node_label, adjacency_matrix=None, temperature=1.0):
     """
@@ -446,7 +472,48 @@ def prompt_loss(node_features, node_label, adjacency_matrix=None, temperature=1.
     pred_loss = -correct_log_softmax.mean()
 
     # 结合Triplets损失
-    triplets = get_triplets(node_features, node_label, adjacency_matrix)
+    triplets = get_triplets_new(node_features, node_label, adjacency_matrix)
+    anchor, positive, negative = node_features[triplets[:, 0]], node_features[triplets[:, 1]], node_features[triplets[:, 2]] 
+    exp_pos = torch.exp(F.cosine_similarity(anchor,positive)/temperature)
+    exp_neg = torch.exp(F.cosine_similarity(anchor,negative)/temperature)
+    cosine_similarity_loss = -1 * torch.log(exp_pos / (exp_pos + exp_neg))
+    triplet_loss = cosine_similarity_loss.mean()
+
+    # 对两种loss求平均
+    loss = pred_loss + triplet_loss
+    
+    return loss, _pred
+
+
+def prompt_loss_with_center(node_features, node_label, c_embedding, adjacency_matrix=None, temperature=1.0):
+    """
+    计算prompt损失函数。
+    
+    :param node_features: 节点特征表示的张量，形状为 (batch_size, num_features)
+    :param node_label: 实例的真实类别标签的张量，形状为 (batch_size,)
+    :param adjacency_matrix: 图的邻接矩阵
+    :param temperature: 温度参数，用于控制softmax的平滑程度
+    :return: 计算得到的prompt损失值
+    """    
+
+    distance = distance2center2(node_features, c_embedding)
+    distance = 1/F.normalize(distance, dim=1)
+    # distance /= temperature   # 应用温度参数  
+
+    pred = F.log_softmax(distance, dim=1)
+    _pred = torch.argmax(pred, dim=1, keepdim=True).squeeze()
+    
+    # 计算log softmax
+    # log_softmax = F.log_softmax(pred, dim=1)
+    
+    # 选择正确类别的log softmax值
+    correct_log_softmax = pred.gather(1, node_label.unsqueeze(1)).squeeze(1)
+    
+    # 计算损失
+    pred_loss = -correct_log_softmax.mean()
+
+    # 结合Triplets损失
+    triplets = get_triplets_new(node_features, node_label, adjacency_matrix)
     anchor, positive, negative = node_features[triplets[:, 0]], node_features[triplets[:, 1]], node_features[triplets[:, 2]] 
     exp_pos = torch.exp(F.cosine_similarity(anchor,positive)/temperature)
     exp_neg = torch.exp(F.cosine_similarity(anchor,negative)/temperature)
