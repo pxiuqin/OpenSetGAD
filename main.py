@@ -1,5 +1,6 @@
+import random
 import joblib
-from train import graph_prompt_train, graphpro_prompt_train, initial_train,continue_train,gpf_prompt_train, initial_train_with_prompt_loss
+from train import graph_prompt_train, graphpro_prompt_train, graphpro_prompt_train_new, initial_train,continue_train,gpf_prompt_train, initial_train_with_prompt_loss, initial_train_with_prompt_loss_new
 import argparse
 from utils import OnlineTripletLoss
 from utils import HardestNegativeTripletSelector
@@ -13,14 +14,28 @@ import numpy as np
 from model_dynamic import GAT
 # from model import GAT
 
+# seed = 123
+# torch.manual_seed(seed)
+# torch.cuda.manual_seed(seed)
+# torch.cuda.manual_seed_all(seed)
+# torch.backends.cudnn.benchmark = True
+# #torch.backends.cudnn.deterministic = True
+# # Set a fixed value for the hash seed
+# os.environ["PYTHONHASHSEED"] = str(seed)
+# np.random.seed(seed)
+# random.seed(seed)
+
+# current_seed = random.getstate()
+# current_np_seed = np.random.get_state()
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # Hyper parameters
     parser.add_argument('--finetune_epochs', default=3, type=int, #embeddings_0430063028
                         help="Number of initial-training/maintenance-training epochs.")
-    parser.add_argument('--prompt_epochs', default=15, type=int,
+    parser.add_argument('--prompt_epochs', default=100, type=int,
                         help="Number of prompt tuning epochs.")
-    parser.add_argument('--n_epochs', default=15, type=int,
+    parser.add_argument('--n_epochs', default=100, type=int,
                         help="Number of initial-training/maintenance-training epochs.")
     parser.add_argument('--oldnum', default=20, type=int,
                         help="Number of sampling.")
@@ -30,7 +45,7 @@ if __name__ == '__main__':
                         help="Number of inference epochs.")
     parser.add_argument('--window_size', default=3, type=int,
                         help="Maintain the model after predicting window_size blocks.")
-    parser.add_argument('--patience', default=5, type=int,
+    parser.add_argument('--patience', default=10, type=int,
                         help="Early stop if performance did not improve in the last patience epochs.")
     parser.add_argument('--margin', default=3., type=float,
                         help="Margin for computing triplet losses")
@@ -116,7 +131,8 @@ if __name__ == '__main__':
     # pre_train_labels = set(np.load("./data/0413_ALL_English/0/labels.npy"))
     
     if args.add_pair:
-        # model, label_center_emb = initial_train(0, args, data_split, metrics, embedding_save_path, loss_fn, None)
+        # model = initial_train_with_prompt_loss_new(0, args, data_split, metrics, embedding_save_path, None, None)   # initial_train
+        # model = initial_train(0, args, data_split, metrics, embedding_save_path, loss_fn, None)
         model = GAT(302, args.hidden_dim, args.out_dim, args.num_heads, args.use_residual, 'finetune')   #, 'finetune'
         best_model_path = f"{embedding_save_path}/block_0/models/best.pt"   # 基于initial_train的最好模型开始进行下面的微调
         # label_center_emb = torch.load(f"{embedding_save_path}/block_0/models/center.pth")
@@ -133,6 +149,8 @@ if __name__ == '__main__':
         if args.use_cuda:
             model.cuda()
 
+        old_label_rate = 0.4   # 初始化旧类占比
+
         if args.is_incremental:
             message = ""
 
@@ -146,7 +164,7 @@ if __name__ == '__main__':
                 # model = continue_train(i, data_split, metrics, embedding_save_path, loss_fn, model, label_center_emb, args)
                 # graph_prompt_train(i, data_split, metrics, embedding_save_path, loss_fn, model, label_center_emb, args, None )   # None  
                 # gpf_prompt_train(i, data_split, metrics, embedding_save_path, loss_fn, model, label_center_emb, args)
-                model, label_center = graphpro_prompt_train(i, data_split, metrics, embedding_save_path, loss_fn, model, label_center, args, score_result=max_score)   # class_emb
+                model, label_center, old_label_rate = graphpro_prompt_train_new(i, data_split, metrics, embedding_save_path, model, label_center, args, old_label_rate, score_result=max_score)   # class_emb
                 message += f"\n M{i}: {max_score}" 
 
             # 输出最好结果
